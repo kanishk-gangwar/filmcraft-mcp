@@ -16,49 +16,90 @@ Routes considered:
 
 ## Setup
 
-Requirements: Node 18+ and the FilmCraft CLI. No Rust, Homebrew or ffmpeg is needed.
+Works on macOS, Windows and Linux. You need:
+- **Node 18+**
+- **Claude Code**
+- the **FilmCraft CLI** (`filmcraft-cli`)
+- optionally, the **FilmCraft desktop app**, to open and watch the projects Claude edits
 
-### Quick install on any machine (no clone)
+No Rust, Homebrew or ffmpeg is needed.
 
-`npx` fetches and builds the server from GitHub. You only need the FilmCraft CLI (next section) and one line:
+### 1. Get the FilmCraft CLI
 
-```bash
-claude mcp add --scope user filmcraft-edit -e FILMCRAFT_CLI=/abs/path/to/filmcraft-cli -- npx -y github:kanishk-gangwar/filmcraft-mcp
-```
+Downloads are on the [FilmCraft releases page](https://github.com/storytold/filmcraft/releases). These steps were tested with v0.17.1.
 
-### From a clone
+| OS | Where the CLI comes from |
+|---|---|
+| macOS | The separate `filmcraft-cli-<ver>-macos-universal.zip` asset (signed and notarized). The `.app` doesn't include the CLI. |
+| Windows | Installed with the app (MSI): `%LOCALAPPDATA%\Programs\ArtCraft\FilmCraft\filmcraft-cli.exe` |
+| Linux | Installed with the `.deb` / `.rpm` package: `/usr/bin/filmcraft-cli` |
 
-```bash
-git clone https://github.com/kanishk-gangwar/filmcraft-mcp.git filmcraft-mcp
-cd filmcraft-mcp && npm install    # also builds dist/
-```
-
-Get the CLI. On macOS, use the signed and notarized release asset (the `.app` doesn't contain it):
-
-```bash
-mkdir -p bin && cd bin && curl -LO https://github.com/storytold/filmcraft/releases/download/v0.17.1/filmcraft-cli-0.17.1-macos-universal.zip && unzip -j filmcraft-cli-0.17.1-macos-universal.zip
-```
-
-The server looks for the CLI at `$FILMCRAFT_CLI`, then `./bin/filmcraft-cli`, then `filmcraft-cli` on `PATH`.
-
-### Register with Claude Code
+On macOS, for example:
 
 ```bash
-claude mcp add --scope user filmcraft-edit -e FILMCRAFT_CLI=$PWD/bin/filmcraft-cli -- node $PWD/dist/index.js
+mkdir -p ~/filmcraft-cli && cd ~/filmcraft-cli && curl -LO https://github.com/storytold/filmcraft/releases/download/v0.17.1/filmcraft-cli-0.17.1-macos-universal.zip && unzip -j filmcraft-cli-0.17.1-macos-universal.zip
 ```
 
-This writes the following to `~/.claude.json`:
+```bash
+~/filmcraft-cli/filmcraft-cli --version
+```
+
+The server looks for the CLI at `$FILMCRAFT_CLI`, then `bin/filmcraft-cli` inside this package, then `filmcraft-cli` on `PATH`.
+
+### 2. Register the server with Claude Code
+
+**Option A: straight from GitHub (recommended, no clone).** `npx` downloads and builds the server. The first start on a machine takes about 30 s; later starts are instant.
+
+```bash
+claude mcp add --scope user filmcraft-edit -e FILMCRAFT_CLI=$HOME/filmcraft-cli/filmcraft-cli -- npx -y github:kanishk-gangwar/filmcraft-mcp
+```
+
+On Windows, set `FILMCRAFT_CLI` to the full path of `filmcraft-cli.exe`.
+
+**Option B: from a clone** (to change the code, or to run the demo):
+
+```bash
+git clone https://github.com/kanishk-gangwar/filmcraft-mcp.git && cd filmcraft-mcp && npm install
+```
+
+`npm install` also builds `dist/`. Then run:
+
+```bash
+claude mcp add --scope user filmcraft-edit -e FILMCRAFT_CLI=$HOME/filmcraft-cli/filmcraft-cli -- node $PWD/dist/index.js
+```
+
+Either command writes an entry like this to `~/.claude.json`:
 
 ```json
 "filmcraft-edit": {
   "type": "stdio",
-  "command": "node",
-  "args": ["/Users/kanishkgangwar/Documents/GitHub/filmcraft-mcp/dist/index.js"],
-  "env": { "FILMCRAFT_CLI": "/Users/kanishkgangwar/Documents/GitHub/filmcraft-mcp/bin/filmcraft-cli" }
+  "command": "npx",
+  "args": ["-y", "github:kanishk-gangwar/filmcraft-mcp"],
+  "env": { "FILMCRAFT_CLI": "/Users/<you>/filmcraft-cli/filmcraft-cli" }
 }
 ```
 
-To share it with a repo instead, put the same block under `mcpServers` in that repo's `.mcp.json`. Optional: set `FFMPEG_PATH` for the `ffmpeg_*` tools.
+To share the server with everyone working in one project, put the same block under `mcpServers` in that project's `.mcp.json`. Optional: set `FFMPEG_PATH` (or install ffmpeg) for the `ffmpeg_*` tools.
+
+### 3. Check it works
+
+```bash
+claude mcp list
+```
+
+You should see `filmcraft-edit: … ✔ Connected`. Then ask Claude something like *"Create a FilmCraft project at ~/Movies/test.fcproj, import ~/Movies/clip.mp4, keep 0–5 s and 10–15 s with a dissolve between them, and render ~/Movies/cut.mp4."*
+
+### 4. See the edit in FilmCraft (optional)
+
+Install the desktop app from the same releases page:
+
+| OS | Package |
+|---|---|
+| macOS | `.dmg` |
+| Windows | `.msi` |
+| Linux | AppImage, Flatpak, `.deb` or `.rpm` |
+
+Open the `.fcproj` Claude wrote (on macOS: `open -a FilmCraft path/to/project.fcproj`). If the project is already open while Claude edits it, use **File ▸ Revert** to load the changes. Don't save from the app while Claude is still editing, or you will overwrite Claude's changes.
 
 ## Tools
 
@@ -91,9 +132,10 @@ Times are in **seconds**. Clip ids come from `list_timeline` and item ids from `
 ## Demo (verified)
 
 ```bash
+export FILMCRAFT_CLI=$HOME/filmcraft-cli/filmcraft-cli   # wherever step 1 put it
 python3 scripts/make_sample.py samples      # 6 s numbered colour frames + beeps (Pillow)
 # build samples/sample.mp4 with FilmCraft itself (no ffmpeg):
-B=bin/filmcraft-cli; S=$PWD/samples
+B=$FILMCRAFT_CLI; S=$PWD/samples   # run from a clone (Option B)
 printf '%s\n' '{"id":"file.newProject","params":{"name":"Master"}}' '{"id":"file.newSequence","params":{"name":"Master","width":640,"height":360,"fps":30}}' | $B --save-as $S/master.fcproj run -
 $B --project $S/master.fcproj --save exec file.import "{\"paths\":[\"$S/frames/f000.png\"],\"imageSequence\":true}"
 $B --project $S/master.fcproj --save exec file.import "{\"paths\":[\"$S/tone.wav\"]}"
