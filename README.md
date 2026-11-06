@@ -23,13 +23,13 @@ Requirements: Node 18+ and the FilmCraft CLI. No Rust, Homebrew or ffmpeg is nee
 `npx` fetches and builds the server from GitHub. You only need the FilmCraft CLI (next section) and one line:
 
 ```bash
-claude mcp add --scope user filmcraft-edit -e FILMCRAFT_CLI=/abs/path/to/filmcraft-cli -- npx -y github:kanishk-gangwar/filmCraft-mcp
+claude mcp add --scope user filmcraft-edit -e FILMCRAFT_CLI=/abs/path/to/filmcraft-cli -- npx -y github:kanishk-gangwar/filmcraft-mcp
 ```
 
 ### From a clone
 
 ```bash
-git clone https://github.com/kanishk-gangwar/filmCraft-mcp.git filmcraft-mcp
+git clone https://github.com/kanishk-gangwar/filmcraft-mcp.git filmcraft-mcp
 cd filmcraft-mcp && npm install    # also builds dist/
 ```
 
