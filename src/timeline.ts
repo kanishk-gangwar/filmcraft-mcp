@@ -4,6 +4,9 @@ type Json = Record<string, unknown>;
 
 const sec = (ticks: unknown): number | null => (typeof ticks === "number" ? Math.round(toSeconds(ticks) * 1000) / 1000 : null);
 
+/** Effects every clip carries; only the ones added on top are worth listing. */
+const INTRINSIC = new Set(["motion", "opacity", "time_remap", "volume", "channel_volume", "panner"]);
+
 const clip = (c: Json) => ({
   clip: c.clip,
   name: c.name,
@@ -16,7 +19,12 @@ const clip = (c: Json) => ({
   ...(c.reverse === true && { reverse: true }),
   ...(c.link != null && { link: c.link }),
   ...(c.enabled === false && { enabled: false }),
+  ...(added(c).length > 0 && { effects: added(c) }),
 });
+
+function added(c: Json): string[] {
+  return ((c.effects as Json[] | undefined) ?? []).map((e) => e.effect as string).filter((id) => !INTRINSIC.has(id));
+}
 
 const track = (t: Json) => ({
   name: t.name,

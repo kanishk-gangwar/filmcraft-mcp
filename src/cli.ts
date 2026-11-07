@@ -24,12 +24,20 @@ export interface RunResult {
   stderr: string;
 }
 
-export function run(bin: string, args: string[], opts: { stdin?: string; timeoutMs?: number } = {}): Promise<RunResult> {
+export function run(
+  bin: string,
+  args: string[],
+  opts: { stdin?: string; timeoutMs?: number; env?: Record<string, string> } = {},
+): Promise<RunResult> {
   return new Promise((done) => {
     const child = execFile(
       bin,
       args,
-      { maxBuffer: 256 * 1024 * 1024, timeout: opts.timeoutMs ?? 0 },
+      {
+        maxBuffer: 256 * 1024 * 1024,
+        timeout: opts.timeoutMs ?? 0,
+        ...(opts.env && { env: { ...process.env, ...opts.env } }),
+      },
       (err, stdout, stderr) => {
         if (!err) return done({ code: 0, stdout, stderr });
         const code = (err as { code?: unknown }).code;
@@ -59,12 +67,63 @@ function parseJson(text: string): unknown {
 
 export const abs = (p: string): string => resolve(p);
 
-/** Runs one engine command against a project file and saves the result back to it. */
-export async function exec(project: string, id: string, params: object = {}, save = true): Promise<unknown> {
-  const args = ["--project", abs(project), "--compact"];
-  if (save) args.push("--save");
-  args.push("exec", id, JSON.stringify(params));
-  const r = await run(cliPath(), args);
+// ---- live app ------------------------------------------------------------------------------------
+
+/** The running FilmCraft app this server drives over its control bridge, when connected. */
+export interface LiveApp {
+  address: string; // 127.0.0.1:PORT
+  token: string; // FILMCRAFT_CONTROL_TOKEN shared with the app
+}
+
+let live: LiveApp | null = null;
+
+export const liveApp = (): LiveApp | null => live;
+export const setLiveApp = (app: LiveApp | null): void => {
+  live = app;
+};
+
+/** A CLI call routed to the live app over the bridge. */
+function bridge(args: string[], opts: { stdin?: string; timeoutMs?: number } = {}): Promise<RunResult> {
+  if (!live) throw new CliError("not connected to the FilmCraft app (call connect_app)");
+  return run(cliPath(), ["--bridge", live.address, ...args], { ...opts, env: { FILMCRAFT_CONTROL_TOKEN: live.token } });
+}
+
+/** The project file the live app has open, or null when it is unsaved / not connected. */
+export async function liveProjectPath(): Promise<string | null> {
+  if (!live) return null;
+  const r = await bridge(["--compact", "inspect", "project"]);
+  if (r.code !== 0) throw new CliError(`the app did not answer: ${r.stderr.trim() || r.stdout.trim()}`);
+  const p = (parseJson(r.stdout) as { path?: string | null } | null)?.path;
+  return p ? resolve(p) : null;
+}
+
+/**
+ * Where a command goes: the live app when connected and `project` is omitted or is the file the app
+ * has open (editing that file headless would fight the app), else the project file.
+ */
+export async function useLive(project?: string): Promise<boolean> {
+  if (!live) {
+    if (!project) throw new CliError("no project given, and not connected to the FilmCraft app (pass project, or call connect_app)");
+    return false;
+  }
+  if (!project) return true;
+  return (await liveProjectPath()) === abs(project);
+}
+
+/**
+ * Runs one engine command: in the live app (see useLive), or against a project file, saving the result
+ * back to it unless save=false.
+ */
+export async function exec(project: string | undefined, id: string, params: object = {}, save = true): Promise<unknown> {
+  let r: RunResult;
+  if (await useLive(project)) {
+    r = await bridge(["--compact", "exec", id, JSON.stringify(params)]);
+  } else {
+    const args = ["--project", abs(project!), "--compact"];
+    if (save) args.push("--save");
+    args.push("exec", id, JSON.stringify(params));
+    r = await run(cliPath(), args);
+  }
   if (r.code !== 0) throw new CliError(`${id} failed: ${r.stderr.trim() || r.stdout.trim()}`);
   return parseJson(r.stdout);
 }
@@ -79,15 +138,21 @@ export interface Step {
  * first failure. `project` is opened first when given; the session is saved to `saveAs` or back to
  * `project`.
  */
-export async function batch(steps: Step[], opts: { project?: string; saveAs?: string; keepGoing?: boolean }): Promise<unknown[]> {
+export async function batch(
+  steps: Step[],
+  opts: { project?: string; saveAs?: string; keepGoing?: boolean; save?: boolean },
+): Promise<unknown[]> {
+  const script = steps.map((s) => JSON.stringify({ id: s.id, params: s.params ?? {} })).join("\n") + "\n";
+  const toApp = !opts.saveAs && (await useLive(opts.project));
   const args = ["--compact"];
-  if (opts.project) args.push("--project", abs(opts.project));
-  if (opts.saveAs) args.push("--save-as", abs(opts.saveAs));
-  else if (opts.project) args.push("--save");
+  if (!toApp) {
+    if (opts.project) args.push("--project", abs(opts.project));
+    if (opts.saveAs) args.push("--save-as", abs(opts.saveAs));
+    else if (opts.project && opts.save !== false) args.push("--save");
+  }
   if (opts.keepGoing) args.push("--keep-going");
   args.push("run", "-");
-  const script = steps.map((s) => JSON.stringify({ id: s.id, params: s.params ?? {} })).join("\n") + "\n";
-  const r = await run(cliPath(), args, { stdin: script });
+  const r = toApp ? await bridge(args, { stdin: script }) : await run(cliPath(), args, { stdin: script });
   const lines = r.stdout
     .split("\n")
     .filter((l) => l.trim())
@@ -102,4 +167,13 @@ export async function batch(steps: Step[], opts: { project?: string; saveAs?: st
 export async function cli(args: string[], timeoutMs?: number): Promise<{ result: unknown; stderr: string; code: number }> {
   const r = await run(cliPath(), args, { timeoutMs });
   return { result: parseJson(r.stdout), stderr: r.stderr.trim(), code: r.code };
+}
+
+/** Whether the app at `app` answers on its control bridge. */
+export async function ping(app: LiveApp): Promise<boolean> {
+  const r = await run(cliPath(), ["--bridge", app.address, "--compact", "inspect", "project"], {
+    env: { FILMCRAFT_CONTROL_TOKEN: app.token },
+    timeoutMs: 5000,
+  });
+  return r.code === 0 && !r.stdout.includes('"error"');
 }

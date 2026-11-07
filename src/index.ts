@@ -2,12 +2,15 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { mkdir } from "node:fs/promises";
 import { z } from "zod";
-import { abs, batch, cli, exec, toTicks } from "./cli.js";
+import { connect } from "./app.js";
+import { abs, batch, cli, exec, liveApp, liveProjectPath, setLiveApp, TICKS_PER_SECOND, toTicks, useLive } from "./cli.js";
 import { ffmpeg } from "./ffmpeg.js";
+import { bakeImageSequence, clipInfo, framing, mediaSize, sequenceInfo } from "./media.js";
 import { summarizeSequence } from "./timeline.js";
 
-const server = new McpServer({ name: "filmcraft", version: "0.1.0" });
+const server = new McpServer({ name: "filmcraft", version: "0.2.0" });
 
 const ok = (value: unknown): CallToolResult => ({
   content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }],
@@ -38,7 +41,10 @@ function tool<S extends z.ZodRawShape>(
   );
 }
 
-const project = z.string().describe("Path to the .fcproj project file");
+const project = z
+  .string()
+  .optional()
+  .describe("Path to the .fcproj project file; omit to edit the FilmCraft app connected with connect_app");
 const seconds = (what: string) => z.number().min(0).describe(`${what}, in seconds`);
 const clipId = z.number().int().describe("Timeline clip id (from list_timeline)");
 const track = z.string().describe('Track name such as "V1", "V2", "A1"');
@@ -47,7 +53,7 @@ const track = z.string().describe('Track name such as "V1", "V2", "A1"');
 
 tool(
   "create_project",
-  "Create a new FilmCraft project file with one empty sequence. The file opens in the FilmCraft desktop app.",
+  "Create a new FilmCraft project file with one empty sequence. When connected to the app (connect_app), it also opens there so later edits show live.",
   {
     path: z.string().describe("Where to write the .fcproj file"),
     name: z.string().default("Untitled").describe("Project and sequence name"),
@@ -68,7 +74,9 @@ tool(
       ],
       { saveAs: a.path },
     );
-    return { project: abs(a.path), results };
+    const openedInApp = liveApp() !== null;
+    if (openedInApp) await exec(undefined, "file.open", { path: abs(a.path) });
+    return { project: abs(a.path), openedInApp, results };
   },
 );
 
@@ -79,12 +87,29 @@ tool(
     project,
     paths: z.array(z.string()).min(1),
     imageSequence: z.boolean().optional().describe("Treat the first numbered still as an image sequence"),
+    bake: z
+      .boolean()
+      .default(false)
+      .describe(
+        "With imageSequence: render the sequence to a ProRes .mov next to the frames and import that instead. The app can keep stale frames of a re-written sequence; a baked movie never is.",
+      ),
+    fps: z.number().positive().default(30).describe("Frame rate of a baked image sequence"),
   },
-  async (a) =>
-    exec(a.project, "file.import", {
-      paths: a.paths.map(abs),
-      ...(a.imageSequence !== undefined && { imageSequence: a.imageSequence }),
-    }),
+  async (a) => {
+    let paths = a.paths.map(abs);
+    let baked: string[] | undefined;
+    if (a.bake) {
+      if (!a.imageSequence) throw new Error("bake applies to image sequences: set imageSequence=true");
+      baked = [];
+      for (const p of paths) baked.push(await bakeImageSequence(p, a.fps));
+      paths = baked;
+    }
+    const result = await exec(a.project, "file.import", {
+      paths,
+      ...(a.imageSequence !== undefined && !a.bake && { imageSequence: a.imageSequence }),
+    });
+    return baked ? { baked, ...(result as object) } : result;
+  },
 );
 
 tool(
@@ -97,12 +122,23 @@ tool(
 
 tool(
   "probe_media",
-  "Media info for a file (codecs, size, rate, duration, streams) as FilmCraft decodes it.",
+  "Media info for a file (codecs, size, rate, duration, streams) as FilmCraft decodes it, with a summary: seconds, size, fps and whether it is portrait.",
   { path: z.string() },
   async (a) => {
     const r = await cli(["probe", abs(a.path), "--compact"]);
     if (r.code !== 0) throw new Error(r.stderr || "probe failed");
-    return r.result;
+    const p = r.result as { duration?: number; video?: { width: number; height: number; frame_rate?: { num: number; den: number } } };
+    const v = p.video;
+    const summary = {
+      seconds: typeof p.duration === "number" ? Math.round((p.duration / TICKS_PER_SECOND) * 1000) / 1000 : undefined,
+      ...(v && {
+        width: v.width,
+        height: v.height,
+        fps: v.frame_rate ? Math.round((v.frame_rate.num / v.frame_rate.den) * 1000) / 1000 : undefined,
+        portrait: v.height > v.width,
+      }),
+    };
+    return { summary, ...p };
   },
   true,
 );
@@ -201,8 +237,19 @@ tool(
     speed: z.number().positive().default(100),
     reverse: z.boolean().default(false),
     ripple: z.boolean().default(true),
+    interpolation: z
+      .enum(["frameSampling", "frameBlending", "opticalFlow"])
+      .optional()
+      .describe("How new frames are made; frameBlending at speed 100 smooths a 24 fps clip in a 30 fps sequence"),
   },
-  async (a) => exec(a.project, "clip.speedDuration", { clips: a.clips, speed: a.speed, reverse: a.reverse, ripple: a.ripple }),
+  async (a) =>
+    exec(a.project, "clip.speedDuration", {
+      clips: a.clips,
+      speed: a.speed,
+      reverse: a.reverse,
+      ripple: a.ripple,
+      ...(a.interpolation && { interpolation: a.interpolation }),
+    }),
 );
 
 tool(
@@ -216,6 +263,10 @@ tool(
     effect: z.string().optional().describe('e.g. "Cross Dissolve", "Dip to Black", "Film Dissolve"'),
     align: z.enum(["center", "start", "end"]).optional(),
     audio: z.boolean().default(false).describe("Apply an audio transition instead"),
+    params: z
+      .record(z.string(), z.unknown())
+      .optional()
+      .describe('Transition parameters, e.g. {"color": [1, 0.5, 0.15, 1], "amount": 100} for light_leak'),
   },
   async (a) =>
     exec(a.project, a.audio ? "sequence.applyAudioTransition" : "sequence.applyVideoTransition", {
@@ -224,6 +275,7 @@ tool(
       ...(a.frames && { frames: a.frames }),
       ...(a.effect && { effect: a.effect }),
       ...(a.align && { align: a.align }),
+      ...(a.params && { params: a.params }),
     }),
 );
 
@@ -283,6 +335,170 @@ tool(
   },
 );
 
+// ---- effects, keyframes, fades, framing ------------------------------------------------------
+
+const effectRef = z
+  .union([z.string(), z.number().int()])
+  .describe('Effect id ("lumetri", "gaussian_blur", "motion", "opacity"…) or its index in the clip\'s effect list');
+
+tool(
+  "apply_effect",
+  "Add a video or audio effect to clips and optionally set its parameters (search ids with list_commands 'effects' or run_command effects.list).",
+  {
+    project,
+    clips: z.array(clipId).min(1),
+    effect: z.string().describe('Effect id, e.g. "lumetri", "vr_denoise", "gaussian_blur", "track_matte"'),
+    params: z.record(z.string(), z.unknown()).optional().describe('Parameter values, e.g. {"amount": 45}'),
+  },
+  async (a) => {
+    await exec(a.project, "effects.apply", { clips: a.clips, effect: a.effect });
+    for (const clip of a.clips) {
+      for (const [param, value] of Object.entries(a.params ?? {})) {
+        await exec(a.project, "effects.setParam", { clip, effect: a.effect, param, value });
+      }
+    }
+    return { clips: a.clips, effect: a.effect, params: a.params ?? {} };
+  },
+);
+
+tool(
+  "set_effect_param",
+  "Set one effect parameter on a clip: a fixed value, or a keyframe at a timeline time (keyframe=true animates it). Motion: scale, position [x,y], rotation. Opacity: opacity, blend (\"Screen\", \"Multiply\"…). Lumetri: exposure, contrast, temperature, saturation, curve_red/green/blue [[x,y]…], vignette_amount…",
+  {
+    project,
+    clip: clipId,
+    effect: effectRef,
+    param: z.string(),
+    value: z.unknown().describe("Number, [x, y], #rrggbb, bool, option name, or curve points"),
+    time: z.number().min(0).optional().describe("Timeline seconds for the keyframe"),
+    keyframe: z.boolean().default(false).describe("Write a keyframe at `time` (and animate the parameter)"),
+  },
+  async (a) => {
+    if (a.keyframe && a.time === undefined) throw new Error("a keyframe needs a time");
+    return exec(a.project, "effects.setParam", {
+      clip: a.clip,
+      effect: a.effect,
+      param: a.param,
+      value: a.value,
+      ...(a.time !== undefined && { time: toTicks(a.time) }),
+      ...(a.keyframe && { keyframe: true }),
+    });
+  },
+);
+
+tool(
+  "fade",
+  "Fade a clip in from black or out to black over N frames with opacity keyframes (works at the very end of a sequence, where Dip to Black can cut instead of fade). Audio clips get a Constant Power fade.",
+  {
+    project,
+    clip: clipId,
+    edge: z.enum(["in", "out"]),
+    frames: z.number().int().positive().default(30),
+  },
+  async (a) => {
+    const c = await clipInfo(a.project, a.clip);
+    if (c.kind === "audio") {
+      return exec(a.project, "sequence.applyAudioTransition", {
+        clip: a.clip,
+        edge: a.edge,
+        frames: a.frames,
+        effect: "constant_power",
+        align: a.edge === "in" ? "start" : "end",
+      });
+    }
+    const n = Math.min(a.frames, c.endFrame - c.startFrame);
+    const keys =
+      a.edge === "in"
+        ? [
+            [c.startFrame, 0],
+            [c.startFrame + n, 100],
+          ]
+        : [
+            [c.endFrame - n, 100],
+            [c.endFrame - 1, 0],
+          ];
+    for (const [frame, value] of keys) {
+      await exec(a.project, "effects.setParam", {
+        clip: a.clip,
+        effect: "opacity",
+        param: "opacity",
+        value,
+        time: Math.round((frame * TICKS_PER_SECOND) / c.fps),
+        keyframe: true,
+      });
+    }
+    return { clip: a.clip, edge: a.edge, frames: n };
+  },
+);
+
+tool(
+  "fit_clip",
+  "Frame a clip in the sequence: fill (cover the frame, cropping) or fit (show it all), zoom further in, and choose which part of the source stays in view. Use it for portrait footage in a landscape sequence (focusY picks the slice) or to punch in on a subject.",
+  {
+    project,
+    clip: clipId,
+    mode: z.enum(["fill", "fit"]).default("fill"),
+    zoom: z.number().min(10).default(100).describe("Percent on top of fill/fit; 150 = punch in 1.5x"),
+    focusX: z.number().min(0).max(1).default(0.5).describe("0 = left edge, 1 = right edge of the source"),
+    focusY: z.number().min(0).max(1).default(0.5).describe("0 = top, 1 = bottom of the source; e.g. 0.35 keeps heads in a portrait clip"),
+  },
+  async (a) => {
+    const [seq, c] = await Promise.all([sequenceInfo(a.project), clipInfo(a.project, a.clip)]);
+    const src = await mediaSize(a.project, c.item);
+    const f = framing({ frameW: seq.width, frameH: seq.height, srcW: src.width, srcH: src.height, ...a });
+    await exec(a.project, "effects.setParam", { clip: a.clip, effect: "motion", param: "scale", value: f.scale });
+    await exec(a.project, "effects.setParam", { clip: a.clip, effect: "motion", param: "position", value: f.position });
+    return { clip: a.clip, ...f, source: [src.width, src.height], frame: [seq.width, seq.height] };
+  },
+);
+
+// ---- the live app ----------------------------------------------------------------------------
+
+tool(
+  "connect_app",
+  "Drive the FilmCraft desktop app live: every edit then shows in its window as it happens. Launches a new FilmCraft window in control mode (an already open window is left alone), or attaches to one started with `--control PORT` and FILMCRAFT_CONTROL_TOKEN. While connected, tools without `project`, or with the project the app has open, edit the app; save with save_project.",
+  {
+    port: z.number().int().min(1024).max(65535).default(7878),
+    launch: z.boolean().default(true).describe("Start the app if nothing answers on the port"),
+    token: z.string().optional().describe("Control token of an app you started yourself (default: $FILMCRAFT_CONTROL_TOKEN, or a fresh one)"),
+    open: z.string().optional().describe("A .fcproj to open in the app once connected"),
+  },
+  async (a) => {
+    const app = await connect({ port: a.port, token: a.token, launch: a.launch });
+    setLiveApp(app);
+    if (a.open) await exec(undefined, "file.open", { path: abs(a.open) });
+    return { connected: app.address, project: await liveProjectPath() };
+  },
+);
+
+tool(
+  "app_status",
+  "Whether this server is driving the FilmCraft app, and which project the app has open.",
+  {},
+  async () => {
+    const app = liveApp();
+    return app ? { connected: app.address, project: await liveProjectPath() } : { connected: false };
+  },
+  true,
+);
+
+tool(
+  "disconnect_app",
+  "Stop driving the app; tools need a project file again. The app keeps running.",
+  {},
+  async () => {
+    setLiveApp(null);
+    return { connected: false };
+  },
+);
+
+tool(
+  "save_project",
+  "Save the project open in the connected app (to its own file, or to `path`).",
+  { path: z.string().optional().describe("Save As this .fcproj instead") },
+  async (a) => (a.path ? exec(undefined, "file.saveAs", { path: abs(a.path) }) : exec(undefined, "file.save", {})),
+);
+
 // ---- reading the timeline --------------------------------------------------------------------
 
 tool(
@@ -309,40 +525,109 @@ tool(
     start: z.number().min(0).optional().describe("Range start in seconds"),
     end: z.number().positive().optional().describe("Range end in seconds"),
     scale: z.number().positive().max(1).optional().describe("Render at a fraction of the frame size"),
-    quality: z.number().int().min(0).max(100).optional(),
+    quality: z.number().int().min(0).max(100).optional().describe("For formats that take one; H.264/HEVC size is set by bitrateMbps"),
+    bitrateMbps: z.number().positive().optional().describe("Target video bitrate for H.264/HEVC, e.g. 40"),
+    bitrateMode: z.enum(["cbr", "vbr1Pass", "vbr2Pass", "crf"]).optional(),
+    maxRenderQuality: z
+      .boolean()
+      .default(false)
+      .describe("Turn on the sequence's Maximum Render Quality first: sharper scaling of large (e.g. 4K) sources"),
     noAudio: z.boolean().default(false),
     allowOffline: z.boolean().default(false).describe("Accept placeholder frames for missing media"),
   },
   async (a) => {
-    const args = ["--project", abs(a.project), "--compact", "export", abs(a.output)];
-    if (a.preset) args.push("--preset", a.preset);
-    if (a.format) args.push("--format", a.format);
-    if (a.start !== undefined || a.end !== undefined) {
-      if (a.start === undefined || a.end === undefined) throw new Error("give both start and end");
-      args.push("--start", String(a.start), "--end", String(a.end));
-    } else {
-      args.push("--range", "entire");
+    if ((a.start === undefined) !== (a.end === undefined)) throw new Error("give both start and end");
+    if (a.maxRenderQuality) await exec(a.project, "sequence.settings", { maxRenderQuality: true });
+    const r = (await exec(
+      a.project,
+      "file.exportMedia",
+      {
+        path: abs(a.output),
+        ...(a.preset && { preset: a.preset }),
+        ...(a.format && { format: a.format }),
+        ...(a.start !== undefined ? { range: "custom", startSeconds: a.start, endSeconds: a.end } : { range: "entire" }),
+        ...(a.scale !== undefined && { scale: a.scale }),
+        ...(a.quality !== undefined && { quality: a.quality }),
+        ...(a.bitrateMbps !== undefined && { bitrateKbps: Math.round(a.bitrateMbps * 1000) }),
+        ...(a.bitrateMode && { bitrateMode: a.bitrateMode }),
+        audio: !a.noAudio,
+        wait: true,
+      },
+      false,
+    )) as { offlineMedia?: unknown[]; warnings?: unknown[] };
+    if (r?.offlineMedia?.length && !a.allowOffline) {
+      throw new Error(`rendered with offline media (placeholder frames): ${JSON.stringify(r.offlineMedia)}; pass allowOffline to accept`);
     }
-    if (a.scale !== undefined) args.push("--scale", String(a.scale));
-    if (a.quality !== undefined) args.push("--quality", String(a.quality));
-    if (a.noAudio) args.push("--no-audio");
-    if (a.allowOffline) args.push("--allow-offline");
-    const r = await cli(args);
-    if (r.code !== 0) throw new Error(`export failed (exit ${r.code}): ${r.stderr}\n${JSON.stringify(r.result)}`);
-    return { output: abs(a.output), result: r.result, warnings: r.stderr || undefined };
+    return { output: abs(a.output), result: r };
   },
 );
 
 tool(
   "render_frame",
-  "Render one Program frame to PNG, to look at the edit.",
-  { project, time: seconds("Frame time"), output: z.string().describe(".png path"), scale: z.number().positive().max(1).optional() },
+  "Render one Program frame to an image, to look at the edit.",
+  {
+    project,
+    time: seconds("Frame time"),
+    output: z.string().describe(".png path (.jpg also works for the live app)"),
+    scale: z.number().positive().max(1).optional().describe("Fraction of the frame size (project files only)"),
+  },
   async (a) => {
-    const args = ["--project", abs(a.project), "render", "--seconds", String(a.time), "--out", abs(a.output)];
+    if (await useLive(a.project)) {
+      await exec(undefined, "file.exportFrame", { target: "program", time: toTicks(a.time), path: abs(a.output) }, false);
+      return { output: abs(a.output) };
+    }
+    const args = ["--project", abs(a.project!), "render", "--seconds", String(a.time), "--out", abs(a.output)];
     if (a.scale !== undefined) args.push("--scale", String(a.scale));
     const r = await cli(args);
     if (r.code !== 0) throw new Error(r.stderr || "render failed");
     return { output: abs(a.output) };
+  },
+  true,
+);
+
+tool(
+  "export_frames",
+  "Export stills to look at footage or the edit: from a source item (to pick moments) or the Program. Give times, or every N seconds over a range.",
+  {
+    project,
+    item: z.number().int().optional().describe("Source item id; omit for the Program (the edit)"),
+    times: z.array(z.number().min(0)).optional().describe("Seconds (source time for an item, timeline time for the Program)"),
+    every: z.number().positive().optional().describe("Instead of times: one frame every N seconds"),
+    start: z.number().min(0).default(0),
+    end: z.number().positive().optional().describe("End of the range for `every` (default: the item's or sequence's duration)"),
+    dir: z.string().describe("Folder to write the frames to"),
+    format: z.enum(["jpeg", "png"]).default("jpeg"),
+  },
+  async (a) => {
+    let times = a.times;
+    if (!times) {
+      if (!a.every) throw new Error("give times or every");
+      let end = a.end;
+      if (end === undefined) {
+        end = a.item !== undefined ? (await mediaSize(a.project, a.item)).seconds : (await sequenceInfo(a.project)).seconds;
+      }
+      times = [];
+      for (let t = a.start; t < end - 1e-6; t += a.every) times.push(Math.round(t * 1000) / 1000);
+    }
+    const ext = a.format === "jpeg" ? "jpg" : "png";
+    const dir = abs(a.dir);
+    const tag = a.item !== undefined ? `item${a.item}` : "program";
+    const frames = times.map((t) => ({ time: t, path: `${dir}/${tag}_${t.toFixed(2).padStart(7, "0")}s.${ext}` }));
+    await mkdir(dir, { recursive: true });
+    await batch(
+      frames.map((f) => ({
+        id: "file.exportFrame",
+        params: {
+          target: a.item !== undefined ? "source" : "program",
+          ...(a.item !== undefined && { item: a.item }),
+          time: toTicks(f.time),
+          format: a.format,
+          path: f.path,
+        },
+      })),
+      { project: a.project, save: false },
+    );
+    return { frames };
   },
   true,
 );
