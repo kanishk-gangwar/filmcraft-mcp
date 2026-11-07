@@ -1,0 +1,12 @@
+{
+  "name": "filmcraft-mcp",
+  "owner": { "name": "Kanishk Gangwar" },
+  "description": "FilmCraft video editing for Claude Code: MCP server and editing skills.",
+  "plugins": [
+    {
+      "name": "filmcraft",
+      "source": "./",
+      "description": "FilmCraft MCP server plus skills for recap montages, shot selection, grade matching, photo titles and render checks."
+    }
+  ]
+}

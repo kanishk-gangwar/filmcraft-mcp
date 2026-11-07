@@ -1,0 +1,25 @@
+{
+  "name": "filmcraft",
+  "version": "0.2.0",
+  "description": "Edit video in FilmCraft from Claude: the filmcraft MCP server (live editing in the app, framing, effects, keyframes, renders) plus skills for reference-matched recap montages, shot selection, grade matching, photo-letter titles and render checks.",
+  "author": { "name": "Kanishk Gangwar" },
+  "homepage": "https://github.com/kanishk-gangwar/filmcraft-mcp",
+  "repository": "https://github.com/kanishk-gangwar/filmcraft-mcp",
+  "license": "MIT",
+  "keywords": ["video", "editing", "filmcraft", "mcp", "montage", "recap", "color-grading"],
+  "userConfig": {
+    "filmcraft_cli": {
+      "type": "file",
+      "title": "filmcraft-cli path",
+      "description": "Full path to the FilmCraft CLI (filmcraft-cli), e.g. /Users/you/filmcraft-cli/filmcraft-cli. Download it from the FilmCraft releases page.",
+      "required": true
+    }
+  },
+  "mcpServers": {
+    "filmcraft": {
+      "command": "npx",
+      "args": ["-y", "github:kanishk-gangwar/filmcraft-mcp"],
+      "env": { "FILMCRAFT_CLI": "${user_config.filmcraft_cli}" }
+    }
+  }
+}

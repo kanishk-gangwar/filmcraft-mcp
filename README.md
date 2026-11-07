@@ -15,6 +15,36 @@ Routes considered:
 - (b) writing `.fcproj` JSON directly works (schema v17, documented in FilmCraft's `docs/project-files.md`), but it is brittle compared with the engine's own commands.
 - (c) patching FilmCraft wasn't needed.
 
+## Install as a Claude Code plugin (MCP server + skills)
+
+The repo is also a Claude Code plugin: one install gives you the MCP server and the editing skills
+below. You still need the FilmCraft CLI (step 1 of Setup) and, to watch edits live, the desktop app.
+
+```
+/plugin install filmcraft --marketplace kanishk-gangwar/filmcraft-mcp
+```
+
+On older Claude Code: `/plugin marketplace add kanishk-gangwar/filmcraft-mcp`, then
+`/plugin install filmcraft@filmcraft-mcp`. Claude Code asks for the full path to `filmcraft-cli`
+(change it later with `claude plugin configure filmcraft@filmcraft-mcp`). Restart Claude Code after
+installing.
+
+### Skills
+
+| Skill | What it does |
+|---|---|
+| `recap-edit` | The whole job: footage + a reference reel → a beat-synced montage that copies the reference's cuts, music, transitions, intro and colour, built live in FilmCraft. Plans the cut as a JSON file (`build_from_plan.py` builds it headless or live; `plan_check.py` catches unused clips and bad in-points) |
+| `analyze-reference` | Takes a reference video apart: every frame, exact cut frames, the beat, flash and light-leak frames, contact sheets of each section |
+| `select-shots` | Samples and scores every clip (sharpness, shake, exposure, colour), review sheets with the landscape slice of portrait clips, best window per clip |
+| `match-grade` | Measures shadows / midtones / highlights / saturation of the reference and the edit and says which way to move; per-shot looks by light |
+| `photo-title` | Animated title made of photos (one per stroke, snapping in), letter shapes traced pixel for pixel from the reference or set in a font, clean anti-aliased edges |
+| `check-render` | Decodes the render and reports frozen stretches, black gaps, hard cuts to black, a static intro, duration, bitrate and audio |
+| `filmcraft-editing` | How to use the tools well: live mode, framing portrait footage, effects, keyframes, fades, baking image sequences, render quality |
+
+Ask in plain words ("edit the clips in ~/Videos/goa like this reel", "check this render") and Claude
+picks the skill, or call one directly, e.g. `/filmcraft:recap-edit`. The skill scripts need Python 3
+with Pillow (`pip install pillow`).
+
 ## Setup
 
 Works on macOS, Windows and Linux. You need:
